@@ -47,6 +47,7 @@ final class IMAPTestServer {
     private let loginResponseDelay: TimeInterval
     private let metricsQueue = DispatchQueue(label: "IMAPTestServer.metrics")
     private var idleCommandCountStorage = 0
+    private var commandLogStorage: [String] = []
     private var clientFds: Set<Int32> = []
     private let clientFdsLock = NSLock()
     private let clientGroup = DispatchGroup()
@@ -74,6 +75,15 @@ final class IMAPTestServer {
 
     private func recordIdleCommand() {
         metricsQueue.sync { idleCommandCountStorage += 1 }
+    }
+
+    /// Every tagged command line received, in order, across all connections.
+    var commandLog: [String] {
+        metricsQueue.sync { commandLogStorage }
+    }
+
+    private func recordCommand(_ line: String) {
+        metricsQueue.sync { commandLogStorage.append(line) }
     }
 
     func start() throws {
@@ -175,10 +185,14 @@ final class IMAPTestServer {
             return
         }
 
-        // Handle on a background queue
+        // Each client gets its own thread, as its handler blocks in read() for the
+        // whole connection. On a GCD global queue it would take one of the
+        // process's 64 constrained workers, and GCD starts none while ncpu of
+        // them are busy: in a full parallel run on a 3-core runner a new client
+        // could wait past the client's 5-second greeting deadline.
         let clientGroup = clientGroup
         clientGroup.enter()
-        DispatchQueue.global().async { [weak self] in
+        let thread = Thread { [weak self] in
             defer { clientGroup.leave() }
             guard let self else {
                 close(clientFd)
@@ -186,6 +200,8 @@ final class IMAPTestServer {
             }
             self.handleClient(fd: clientFd)
         }
+        thread.name = "IMAPTestServer client"
+        thread.start()
     }
 
     private func handleClient(fd fileDescriptor: Int32) {
@@ -229,6 +245,7 @@ final class IMAPTestServer {
                 let tag = parts[0]
                 let command = parts[1].uppercased()
                 let args = parts.count > 2 ? parts[2] : ""
+                recordCommand(line)
 
                 if command == "IDLE" {
                     recordIdleCommand()
@@ -395,6 +412,7 @@ final class IMAPTestServer {
         }
 
         let matched = parseSequenceSet(seqStr, uidMode: uidMode)
+        let headerFieldNames = parseHeaderFieldNames(itemsStr)
         var response = ""
 
         for msg in matched {
@@ -427,6 +445,11 @@ final class IMAPTestServer {
                 let headerStr = String(data: msg.headerData, encoding: .utf8) ?? ""
                 fetchItems.append("BODY[HEADER] {\(msg.headerData.count)}\r\n\(headerStr)")
             }
+            if let names = headerFieldNames {
+                let block = Self.headerFieldsBlock(msg.headerData, names: names)
+                let echoed = names.joined(separator: " ")
+                fetchItems.append("BODY[HEADER.FIELDS (\(echoed))] {\(block.utf8.count)}\r\n\(block)")
+            }
             if itemsStr.contains("BODY[TEXT]") || itemsStr.contains("BODY.PEEK[TEXT]") {
                 let bodyStr = String(data: msg.body, encoding: .utf8) ?? ""
                 fetchItems.append("BODY[TEXT] {\(msg.body.count)}\r\n\(bodyStr)")
@@ -437,6 +460,37 @@ final class IMAPTestServer {
 
         response += "\(tag) OK \(uidMode ? "UID " : "")FETCH completed\r\n"
         return response
+    }
+
+    /// The field names of a `BODY[.PEEK][HEADER.FIELDS (...)]` item, if one was asked for.
+    private func parseHeaderFieldNames(_ items: String) -> [String]? {
+        let pattern = #"BODY(?:\.PEEK)?\[HEADER\.FIELDS \(([^)]*)\)\]"#
+        guard let regex = try? NSRegularExpression(pattern: pattern),
+              let match = regex.firstMatch(in: items, range: NSRange(items.startIndex..., in: items)),
+              let range = Range(match.range(at: 1), in: items) else {
+            return nil
+        }
+        return items[range].split(separator: " ").map {
+            $0.trimmingCharacters(in: CharacterSet(charactersIn: "\""))
+        }
+    }
+
+    /// The lines of the fields named in `names` (case-insensitive), folded lines
+    /// kept, in the message's order and closed by the empty line, as servers send
+    /// `BODY[HEADER.FIELDS (...)]`.
+    private static func headerFieldsBlock(_ headerData: Data, names: [String]) -> String {
+        let header = String(data: headerData, encoding: .utf8) ?? ""
+        var fields: [String] = []
+        for line in header.components(separatedBy: "\r\n") where !line.isEmpty {
+            if line.first == " " || line.first == "\t", !fields.isEmpty {
+                fields[fields.count - 1] += "\r\n" + line
+            } else {
+                fields.append(line)
+            }
+        }
+        let wanted = Set(names.map { $0.uppercased() })
+        let selected = fields.filter { wanted.contains($0.prefix { $0 != ":" }.uppercased()) }
+        return selected.map { $0 + "\r\n" }.joined() + "\r\n"
     }
 
     private func parseSequenceSet(_ seqStr: String, uidMode: Bool) -> [Message] {
